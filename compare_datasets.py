@@ -37,6 +37,18 @@ def load_images(spec, n, seed=42):
         if len(out) >= n: break
     return out[:n]
 
+def otsu_binarize(img):
+    """L-mode PIL -> pure black ink on white bg (kills scan/contrast confound)"""
+    from PIL import Image
+    a = np.asarray(img)
+    hist = np.bincount(a.ravel(), minlength=256).astype(float)
+    w = hist.cumsum(); m = (hist * np.arange(256)).cumsum()
+    w1 = w[-1] - w; mu0 = np.where(w > 0, m / np.maximum(w, 1e-9), 0)
+    mu1 = np.where(w1 > 0, (m[-1] - m) / np.maximum(w1, 1e-9), 0)
+    var = w * w1 * (mu0 - mu1) ** 2
+    t = int(np.argmax(var))
+    return Image.fromarray(np.where(a <= t, 0, 255).astype(np.uint8))
+
 def patches(img, side, max_p=3, min_ink=0.01):
     """resize to height=side, slice up to max_p square windows, drop near-empty."""
     from PIL import Image
@@ -54,12 +66,13 @@ def patches(img, side, max_p=3, min_ink=0.01):
 @np.errstate(all="ignore")
 def _noop(): pass
 
-def embed_all(imgs, encoder, device, bs=64):
+def embed_all(imgs, encoder, device, bs=64, binarize=False):
     import torch, timm
     from timm.data import resolve_data_config, create_transform
     kw = {"img_size": 224} if "dinov2" in encoder else {}
     model = timm.create_model(encoder, pretrained=True, num_classes=0, **kw).to(device).eval()
     cfg = resolve_data_config({}, model=model)
+    if kw: cfg["input_size"] = (3, kw["img_size"], kw["img_size"])   # transform must match override
     side = cfg["input_size"][1]
     tf = create_transform(**cfg)
     feats = []
@@ -71,6 +84,7 @@ def embed_all(imgs, encoder, device, bs=64):
             f = model(x).float().cpu().numpy()
             feats.append(f); batch.clear()
         for im in imgs:
+            if binarize: im = otsu_binarize(im)
             for p in patches(im, side):
                 batch.append(tf(p))
                 if len(batch) >= bs: flush()
@@ -139,6 +153,7 @@ def main():
                     choices=["mobilenet", "dinov2"],)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default=None, help="tsv output path")
+    ap.add_argument("--binarize", action="store_true", help="Otsu ink/bg before embedding")
     a = ap.parse_args()
     enc = {"mobilenet": "mobilenetv2_100.ra_in1k",
            "dinov2": "vit_small_patch14_dinov2.lvd142m"}[a.encoder]
@@ -146,14 +161,14 @@ def main():
     rname, rpath = a.ref.split("=", 1)
     print(f"encoder={enc} | n={a.n}/dataset | ref={rname}:{rpath}", flush=True)
     print(f"[embed] {rname}...", flush=True)
-    R = embed_all(load_images(rpath, a.n), enc, a.device)
+    R = embed_all(load_images(rpath, a.n), enc, a.device, binarize=a.binarize)
     print(f"  ref patches: {len(R)}", flush=True)
 
     rows = []
     for spec in a.data:
         name, path = spec.split("=", 1)
         print(f"[embed] {name}...", flush=True)
-        X = embed_all(load_images(path, a.n), enc, a.device)
+        X = embed_all(load_images(path, a.n), enc, a.device, binarize=a.binarize)
         print(f"  patches: {len(X)}", flush=True)
         kid_m, kid_s = kid(X, R)
         cov, dens = coverage_density(X, R)
